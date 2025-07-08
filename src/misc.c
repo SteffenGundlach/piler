@@ -803,6 +803,28 @@ int get_size_from_smtp_mail_from(char *s){
    return size;
 }
 
+static void base64_encode(const unsigned char *in, size_t len, char *out, size_t outlen){
+   static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+   size_t i, j=0; uint32_t v;
+   for(i=0;i<len && j+4<outlen;i+=3){
+      v = in[i]<<16;
+      if(i+1<len) v |= in[i+1]<<8;
+      if(i+2<len) v |= in[i+2];
+      out[j++] = tbl[(v>>18)&0x3F];
+      out[j++] = tbl[(v>>12)&0x3F];
+      out[j++] = (i+1<len) ? tbl[(v>>6)&0x3F] : '=';
+      out[j++] = (i+2<len) ? tbl[v&0x3F] : '=';
+   }
+   out[j] = '\0';
+}
+
+static int smtp_expect_ok(struct net *net, char *buf, int len){
+   int n = recvtimeoutssl(net, buf, len);
+   if(n <= 0) return -1;
+   if(buf[0] != '2' && buf[0] != '3') return -1;
+   return 0;
+}
+
 int forward_email(char *filename, char *from, char *recipients, struct config *cfg){
    if(cfg->smtp_forward[0] == '\0' || recipients == NULL || recipients[0] == '\0') return 0;
 
@@ -817,9 +839,15 @@ int forward_email(char *filename, char *from, char *recipients, struct config *c
       if(port <= 0) port = 25;
    }
 
-   char portstr[8];
-   struct addrinfo hints, *res, *rp;
-   int fd = -1, rc;
+   struct addrinfo hints, *res, *rp; char portstr[8];
+   int rc; int ret = -1;
+   struct net net; struct data data;
+
+   memset(&net, 0, sizeof(net));
+   net.socket = -1;
+   net.timeout = cfg->smtp_forward_timeout > 0 ? cfg->smtp_forward_timeout : 30;
+   net.use_ssl = cfg->smtp_forward_tls;
+   data.net = &net;
 
    memset(&hints, 0, sizeof(hints));
    hints.ai_family = AF_UNSPEC;
@@ -833,49 +861,81 @@ int forward_email(char *filename, char *from, char *recipients, struct config *c
    }
 
    for(rp = res; rp != NULL; rp = rp->ai_next){
-      fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-      if(fd == -1) continue;
-      if(connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-      close(fd); fd = -1;
+      net.socket = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if(net.socket == -1) continue;
+      if(connect(net.socket, rp->ai_addr, rp->ai_addrlen) == 0) break;
+      close(net.socket); net.socket = -1;
    }
 
    freeaddrinfo(res);
+   if(net.socket == -1) return -1;
 
-   if(fd == -1) return -1;
+   if(net.use_ssl){
+      if(init_ssl_to_server(&data) != OK){
+         close_connection(&net);
+         return -1;
+      }
+   }
 
    char buf[SMALLBUFSIZE];
-   recv(fd, buf, sizeof(buf)-1, 0); /* banner */
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
 
-   snprintf(buf, sizeof(buf)-1, "HELO %s\r\n", cfg->hostid);
-   send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+   snprintf(buf, sizeof(buf)-1, "EHLO %s\r\n", cfg->hostid);
+   write1(&net, buf, strlen(buf));
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
 
-   snprintf(buf, sizeof(buf)-1, "MAIL FROM:<%s>\r\n", from && from[0] ? from : "");
-   send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+   if(cfg->smtp_forward_user[0]){
+      char cred[MAXVAL*2]; char b64[SMALLBUFSIZE];
+      snprintf(cred, sizeof(cred)-1, "\0%s\0%s", cfg->smtp_forward_user, cfg->smtp_forward_password);
+      base64_encode((unsigned char*)cred, strlen(cred), b64, sizeof(b64));
+      snprintf(buf, sizeof(buf)-1, "AUTH PLAIN %s\r\n", b64);
+      write1(&net, buf, strlen(buf));
+      if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0){
+         syslog(LOG_PRIORITY, "forward_email: auth failed: %s", buf);
+         goto END;
+      }
+   }
+
+   const char *envfrom = cfg->smtp_forward_envelope_from[0] ? cfg->smtp_forward_envelope_from : (from && from[0] ? from : "");
+   snprintf(buf, sizeof(buf)-1, "MAIL FROM:<%s>\r\n", envfrom);
+   write1(&net, buf, strlen(buf));
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
 
    char rcpt[SMALLBUFSIZE];
    char *r = recipients;
    do {
       r = split_str(r, " ", rcpt, sizeof(rcpt)-1);
-      if(strlen(rcpt) > 0){
+      if(rcpt[0]){
          snprintf(buf, sizeof(buf)-1, "RCPT TO:<%s>\r\n", rcpt);
-         send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+         write1(&net, buf, strlen(buf));
+         if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
       }
    } while(r);
 
-   send(fd, "DATA\r\n", 6, 0); recv(fd, buf, sizeof(buf)-1, 0);
+   write1(&net, "DATA\r\n", 6);
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
 
    FILE *f = fopen(filename, "r");
    if(f){
+      if(cfg->smtp_forward_envelope_from[0]){
+         snprintf(buf, sizeof(buf)-1, "Return-Path: <%s>\r\n", envfrom);
+         write1(&net, buf, strlen(buf));
+      }
       size_t n;
       while((n = fread(buf, 1, sizeof(buf), f)) > 0){
-         send(fd, buf, n, 0);
+         if(write1(&net, buf, n) == -1){ fclose(f); goto END; }
       }
       fclose(f);
    }
-   send(fd, "\r\n.\r\n", 5, 0); recv(fd, buf, sizeof(buf)-1, 0);
+   write1(&net, "\r\n.\r\n", 5);
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
 
-   send(fd, "QUIT\r\n", 6, 0); recv(fd, buf, sizeof(buf)-1, 0);
-   close(fd);
+   write1(&net, "QUIT\r\n", 6);
+   smtp_expect_ok(&net, buf, sizeof(buf));
 
-   return 0;
+   ret = 0;
+
+END:
+   close_connection(&net);
+   return ret;
 }

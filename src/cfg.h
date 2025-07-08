@@ -113,6 +113,11 @@ struct config {
    char recipient_delimiter[MAXVAL];
 
    char smtp_forward[MAXVAL];
+   int smtp_forward_tls;
+   char smtp_forward_user[MAXVAL];
+   char smtp_forward_password[MAXVAL];
+   int smtp_forward_timeout;
+   char smtp_forward_envelope_from[MAXVAL];
 };
 
 

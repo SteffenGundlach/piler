@@ -33,3 +33,18 @@ Features:
 - online status info
 - accounting
 - recognised formats: PST, EML, Maildir, mailbox
+
+## Smarthost forwarding
+
+Archived emails can optionally be forwarded to an external SMTP server once they
+have been stored. Set `smtp_forward` to the hostname (and optional port) of the
+smarthost in `piler.conf`. Authentication and TLS are supported via the
+following options:
+
+- `smtp_forward_tls` – enable TLS for the connection
+- `smtp_forward_user` and `smtp_forward_password` – credentials for SMTP AUTH
+- `smtp_forward_timeout` – connection timeout in seconds
+- `smtp_forward_envelope_from` – override the envelope sender
+
+If these parameters are defined, each message will be sent to the configured
+server immediately after archiving.
