@@ -111,6 +111,8 @@ struct config {
    int verifyssl;
 
    char recipient_delimiter[MAXVAL];
+
+   char smtp_forward[MAXVAL];
 };
 
 

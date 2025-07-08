@@ -802,3 +802,80 @@ int get_size_from_smtp_mail_from(char *s){
 
    return size;
 }
+
+int forward_email(char *filename, char *from, char *recipients, struct config *cfg){
+   if(cfg->smtp_forward[0] == '\0' || recipients == NULL || recipients[0] == '\0') return 0;
+
+   char host[MAXVAL];
+   int port = 25;
+
+   snprintf(host, sizeof(host)-1, "%s", cfg->smtp_forward);
+   char *p = strchr(host, ':');
+   if(p){
+      *p = '\0';
+      port = atoi(p+1);
+      if(port <= 0) port = 25;
+   }
+
+   char portstr[8];
+   struct addrinfo hints, *res, *rp;
+   int fd = -1, rc;
+
+   memset(&hints, 0, sizeof(hints));
+   hints.ai_family = AF_UNSPEC;
+   hints.ai_socktype = SOCK_STREAM;
+
+   snprintf(portstr, sizeof(portstr)-1, "%d", port);
+
+   if((rc = getaddrinfo(host, portstr, &hints, &res)) != 0){
+      syslog(LOG_PRIORITY, "forward_email: getaddrinfo for '%s': %s", host, gai_strerror(rc));
+      return -1;
+   }
+
+   for(rp = res; rp != NULL; rp = rp->ai_next){
+      fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if(fd == -1) continue;
+      if(connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+      close(fd); fd = -1;
+   }
+
+   freeaddrinfo(res);
+
+   if(fd == -1) return -1;
+
+   char buf[SMALLBUFSIZE];
+   recv(fd, buf, sizeof(buf)-1, 0); /* banner */
+
+   snprintf(buf, sizeof(buf)-1, "HELO %s\r\n", cfg->hostid);
+   send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+
+   snprintf(buf, sizeof(buf)-1, "MAIL FROM:<%s>\r\n", from && from[0] ? from : "");
+   send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+
+   char rcpt[SMALLBUFSIZE];
+   char *r = recipients;
+   do {
+      r = split_str(r, " ", rcpt, sizeof(rcpt)-1);
+      if(strlen(rcpt) > 0){
+         snprintf(buf, sizeof(buf)-1, "RCPT TO:<%s>\r\n", rcpt);
+         send(fd, buf, strlen(buf), 0); recv(fd, buf, sizeof(buf)-1, 0);
+      }
+   } while(r);
+
+   send(fd, "DATA\r\n", 6, 0); recv(fd, buf, sizeof(buf)-1, 0);
+
+   FILE *f = fopen(filename, "r");
+   if(f){
+      size_t n;
+      while((n = fread(buf, 1, sizeof(buf), f)) > 0){
+         send(fd, buf, n, 0);
+      }
+      fclose(f);
+   }
+   send(fd, "\r\n.\r\n", 5, 0); recv(fd, buf, sizeof(buf)-1, 0);
+
+   send(fd, "QUIT\r\n", 6, 0); recv(fd, buf, sizeof(buf)-1, 0);
+   close(fd);
+
+   return 0;
+}
