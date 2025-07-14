@@ -183,6 +183,8 @@ int process_email(char *filename, struct session_data *sdata, struct data *data,
       counters.c_rcvd = 1;
       counters.c_size += sdata->tot_len;
       counters.c_stored_size = sdata->stored_len;
+
+      forward_email(filename, sdata->fromemail, parser_state.b_journal_to[0] ? parser_state.b_journal_to : parser_state.b_to, cfg);
    }
    else if(rc == ERR_EXISTS){
       status = S_STATUS_DUPLICATE;

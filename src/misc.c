@@ -802,3 +802,140 @@ int get_size_from_smtp_mail_from(char *s){
 
    return size;
 }
+
+static void base64_encode(const unsigned char *in, size_t len, char *out, size_t outlen){
+   static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+   size_t i, j=0; uint32_t v;
+   for(i=0;i<len && j+4<outlen;i+=3){
+      v = in[i]<<16;
+      if(i+1<len) v |= in[i+1]<<8;
+      if(i+2<len) v |= in[i+2];
+      out[j++] = tbl[(v>>18)&0x3F];
+      out[j++] = tbl[(v>>12)&0x3F];
+      out[j++] = (i+1<len) ? tbl[(v>>6)&0x3F] : '=';
+      out[j++] = (i+2<len) ? tbl[v&0x3F] : '=';
+   }
+   out[j] = '\0';
+}
+
+static int smtp_expect_ok(struct net *net, char *buf, int len){
+   int n = recvtimeoutssl(net, buf, len);
+   if(n <= 0) return -1;
+   if(buf[0] != '2' && buf[0] != '3') return -1;
+   return 0;
+}
+
+int forward_email(char *filename, char *from, char *recipients, struct config *cfg){
+   if(cfg->smtp_forward[0] == '\0' || recipients == NULL || recipients[0] == '\0') return 0;
+
+   char host[MAXVAL];
+   int port = 25;
+
+   snprintf(host, sizeof(host)-1, "%s", cfg->smtp_forward);
+   char *p = strchr(host, ':');
+   if(p){
+      *p = '\0';
+      port = atoi(p+1);
+      if(port <= 0) port = 25;
+   }
+
+   struct addrinfo hints, *res, *rp; char portstr[8];
+   int rc; int ret = -1;
+   struct net net; struct data data;
+
+   memset(&net, 0, sizeof(net));
+   net.socket = -1;
+   net.timeout = cfg->smtp_forward_timeout > 0 ? cfg->smtp_forward_timeout : 30;
+   net.use_ssl = cfg->smtp_forward_tls;
+   data.net = &net;
+
+   memset(&hints, 0, sizeof(hints));
+   hints.ai_family = AF_UNSPEC;
+   hints.ai_socktype = SOCK_STREAM;
+
+   snprintf(portstr, sizeof(portstr)-1, "%d", port);
+
+   if((rc = getaddrinfo(host, portstr, &hints, &res)) != 0){
+      syslog(LOG_PRIORITY, "forward_email: getaddrinfo for '%s': %s", host, gai_strerror(rc));
+      return -1;
+   }
+
+   for(rp = res; rp != NULL; rp = rp->ai_next){
+      net.socket = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if(net.socket == -1) continue;
+      if(connect(net.socket, rp->ai_addr, rp->ai_addrlen) == 0) break;
+      close(net.socket); net.socket = -1;
+   }
+
+   freeaddrinfo(res);
+   if(net.socket == -1) return -1;
+
+   if(net.use_ssl){
+      if(init_ssl_to_server(&data) != OK){
+         close_connection(&net);
+         return -1;
+      }
+   }
+
+   char buf[SMALLBUFSIZE];
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+
+   snprintf(buf, sizeof(buf)-1, "EHLO %s\r\n", cfg->hostid);
+   write1(&net, buf, strlen(buf));
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+
+   if(cfg->smtp_forward_user[0]){
+      char cred[MAXVAL*2]; char b64[SMALLBUFSIZE];
+      snprintf(cred, sizeof(cred)-1, "\0%s\0%s", cfg->smtp_forward_user, cfg->smtp_forward_password);
+      base64_encode((unsigned char*)cred, strlen(cred), b64, sizeof(b64));
+      snprintf(buf, sizeof(buf)-1, "AUTH PLAIN %s\r\n", b64);
+      write1(&net, buf, strlen(buf));
+      if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0){
+         syslog(LOG_PRIORITY, "forward_email: auth failed: %s", buf);
+         goto END;
+      }
+   }
+
+   const char *envfrom = cfg->smtp_forward_envelope_from[0] ? cfg->smtp_forward_envelope_from : (from && from[0] ? from : "");
+   snprintf(buf, sizeof(buf)-1, "MAIL FROM:<%s>\r\n", envfrom);
+   write1(&net, buf, strlen(buf));
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+
+   char rcpt[SMALLBUFSIZE];
+   char *r = recipients;
+   do {
+      r = split_str(r, " ", rcpt, sizeof(rcpt)-1);
+      if(rcpt[0]){
+         snprintf(buf, sizeof(buf)-1, "RCPT TO:<%s>\r\n", rcpt);
+         write1(&net, buf, strlen(buf));
+         if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+      }
+   } while(r);
+
+   write1(&net, "DATA\r\n", 6);
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+
+   FILE *f = fopen(filename, "r");
+   if(f){
+      if(cfg->smtp_forward_envelope_from[0]){
+         snprintf(buf, sizeof(buf)-1, "Return-Path: <%s>\r\n", envfrom);
+         write1(&net, buf, strlen(buf));
+      }
+      size_t n;
+      while((n = fread(buf, 1, sizeof(buf), f)) > 0){
+         if(write1(&net, buf, n) == -1){ fclose(f); goto END; }
+      }
+      fclose(f);
+   }
+   write1(&net, "\r\n.\r\n", 5);
+   if(smtp_expect_ok(&net, buf, sizeof(buf)) != 0) goto END;
+
+   write1(&net, "QUIT\r\n", 6);
+   smtp_expect_ok(&net, buf, sizeof(buf));
+
+   ret = 0;
+
+END:
+   close_connection(&net);
+   return ret;
+}

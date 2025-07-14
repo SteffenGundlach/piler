@@ -55,5 +55,6 @@ int init_ssl_to_server(struct data *data);
 
 int append_string_to_buffer(char **buffer, char *str);
 int get_size_from_smtp_mail_from(char *s);
+int forward_email(char *filename, char *from, char *recipients, struct config *cfg);
 
 #endif /* _MISC_H */
